@@ -45,6 +45,7 @@ struct mag_config {
     gss_key_value_set_desc *cred_store;
     struct seal_key *mag_skey;
     bool use_basic_auth;
+    bool use_ntlm_auth;
 };
 
 struct mag_conn {

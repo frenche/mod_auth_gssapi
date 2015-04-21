@@ -32,6 +32,9 @@ APLOG_USE_MODULE(auth_gssapi);
 
 APR_DECLARE_OPTIONAL_FN(int, ssl_is_https, (conn_rec *));
 
+static const char ntlm_oid[] = "\x2b\x06\x01\x04\x01\x82\x37\x02\x02\x0a";
+gss_OID_desc ntlm_mech_oid = { 10, &ntlm_oid };
+
 static char *mag_status(request_rec *req, int type, uint32_t err)
 {
     uint32_t maj_ret, min_ret;
@@ -208,6 +211,7 @@ static int mag_auth(request_rec *req)
 {
     const char *type;
     const char *auth_type;
+    size_t auth_type_len = 0;
     struct mag_config *cfg;
     const char *auth_header;
     char *auth_header_type;
@@ -230,7 +234,10 @@ static int mag_auth(request_rec *req)
     size_t replen;
     char *clientname;
     gss_OID mech_type = GSS_C_NO_OID;
+    gss_OID_set desired_mechs = GSS_C_NO_OID_SET;
     gss_buffer_desc lname = GSS_C_EMPTY_BUFFER;
+    gss_buffer_desc mech_buff = GSS_C_EMPTY_BUFFER;
+    bool is_ntlm = false;
     struct mag_conn *mc = NULL;
     bool is_basic = false;
     gss_ctx_id_t user_ctx = GSS_C_NO_CONTEXT;
@@ -301,13 +308,15 @@ static int mag_auth(request_rec *req)
         mag_check_session(req, cfg, &mc);
     }
 
+    auth_header = apr_table_get(req->headers_in, "Authorization");
+
     if (mc) {
         /* register the context in the memory pool, so it can be freed
          * when the connection/request is terminated */
         apr_pool_userdata_set(mc, "mag_conn_ptr",
                               mag_conn_destroy, mc->parent);
 
-        if (mc->established) {
+        if (mc->established && !auth_header) {
             ap_log_rerror(APLOG_MARK, APLOG_DEBUG|APLOG_NOERRNO, 0, req,
                           "Already established context found!");
             apr_table_set(req->subprocess_env, "GSS_NAME", mc->gss_name);
@@ -321,7 +330,6 @@ static int mag_auth(request_rec *req)
         pctx = &ctx;
     }
 
-    auth_header = apr_table_get(req->headers_in, "Authorization");
     if (!auth_header) goto done;
 
     auth_header_type = ap_getword_white(req->pool, &auth_header);
@@ -329,7 +337,18 @@ static int mag_auth(request_rec *req)
 
     if (strcasecmp(auth_header_type, "Negotiate") == 0) {
         auth_type = "Negotiate";
-
+        auth_type_len = 10;
+        auth_header_value = ap_getword_white(req->pool, &auth_header);
+        if (!auth_header_value) goto done;
+        input.length = apr_base64_decode_len(auth_header_value) + 1;
+        input.value = apr_pcalloc(req->pool, input.length);
+        if (!input.value) goto done;
+        input.length = apr_base64_decode(input.value, auth_header_value);
+    } else if ((strcasecmp(auth_header_type, "NTLM") == 0)  &&
+               (cfg->use_ntlm_auth == true)) {
+        auth_type = "NTLM";
+        auth_type_len = 5;
+        is_ntlm = true;
         auth_header_value = ap_getword_white(req->pool, &auth_header);
         if (!auth_header_value) goto done;
         input.length = apr_base64_decode_len(auth_header_value) + 1;
@@ -339,6 +358,7 @@ static int mag_auth(request_rec *req)
     } else if ((strcasecmp(auth_header_type, "Basic") == 0) &&
                (cfg->use_basic_auth == true)) {
         auth_type = "Basic";
+        auth_type_len = 6;
         is_basic = true;
 
         gss_buffer_desc ba_user;
@@ -424,11 +444,26 @@ static int mag_auth(request_rec *req)
     }
 #endif
 
-    if (is_basic) {
+    if (1) {
+        maj = gss_create_empty_oid_set(&min, &desired_mechs);
+        if (GSS_ERROR(maj)) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, req,
+                              "%s", mag_error(req, "gss_create_empty_oid_set()"
+                                              " failed", maj, min));
+            goto done;
+        }
+        maj = gss_add_oid_set_member(&min, &ntlm_mech_oid, &desired_mechs);
+        if (GSS_ERROR(maj)) {
+            gss_release_oid_set(&min, &desired_mechs);
+            ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, req,
+                              "%s", mag_error(req, "gss_add_oid_set_member()"
+                                              " failed", maj, min));
+            goto done;
+        }
         if (!acquired_cred) {
             /* Try to acquire default creds */
             maj = gss_acquire_cred(&min, GSS_C_NO_NAME, GSS_C_INDEFINITE,
-                                   GSS_C_NO_OID_SET, cred_usage,
+                                   desired_mechs, cred_usage,
                                    &acquired_cred, NULL, NULL);
             if (GSS_ERROR(maj)) {
                 ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, req,
@@ -445,6 +480,9 @@ static int mag_auth(request_rec *req)
                                           "failed", maj, min));
             goto done;
         }
+    }
+
+    if (is_basic) {
         /* output and input are inverted here, this is intentional */
         maj = gss_init_sec_context(&min, user_cred, &user_ctx, server,
                                    GSS_C_NO_OID, 0, 300,
@@ -468,6 +506,32 @@ static int mag_auth(request_rec *req)
                                 maj, min));
         goto done;
     }
+    /*maj = gss_oid_to_str(&min, mech_type, &mech_buff);
+    if (GSS_ERROR(maj)) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, req, "%s",
+                      mag_error(req, "gss_oid_to_str() failed",
+                                maj, min));
+        goto done;
+    }
+    if(mech_buff.length && mech_buff.value)
+        fprintf(stderr, "Mech OID from accept: %.*s\n",
+                mech_buff.length, (char *) mech_buff.value);
+    else
+        fprintf(stderr, "No Mech OID from accept\n");
+    gss_release_buffer(&min, &mech_buff);
+
+    if(is_ntlm) {
+        if(mech_type->length != ntlm_mech_oid.length ||
+            memcmp(mech_type->elements, ntlm_mech_oid.elements, mech_type->length)) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, req,
+                          "Not NTLM mech in an NTLM authentication - aborting");
+            gss_delete_sec_context(&min, pctx, GSS_C_NO_BUFFER);
+            gss_release_buffer(&min, &output);
+            output.length = 0;
+            goto done;
+        }
+    } */
+
     if (is_basic) {
         while (maj == GSS_S_CONTINUE_NEEDED) {
             gss_release_buffer(&min, &input);
@@ -561,19 +625,23 @@ static int mag_auth(request_rec *req)
     ret = OK;
 
 done:
-    if (ret == HTTP_UNAUTHORIZED) {
+    if (ret == HTTP_UNAUTHORIZED || !is_basic) {
         if (output.length != 0) {
             replen = apr_base64_encode_len(output.length) + 1;
-            reply = apr_pcalloc(req->pool, 10 + replen);
+            reply = apr_pcalloc(req->pool, auth_type_len + replen);
             if (reply) {
-                memcpy(reply, "Negotiate ", 10);
-                apr_base64_encode(&reply[10], output.value, output.length);
+                memcpy(reply, auth_type, auth_type_len);
+                reply[auth_type_len -1] = ' ';
+                apr_base64_encode(&reply[auth_type_len], output.value, output.length);
                 apr_table_add(req->err_headers_out,
                               "WWW-Authenticate", reply);
             }
-        } else {
+        } else if (ret == HTTP_UNAUTHORIZED) {
             apr_table_add(req->err_headers_out,
                           "WWW-Authenticate", "Negotiate");
+            if (cfg->use_ntlm_auth)
+                apr_table_add(req->err_headers_out,
+                          "WWW-Authenticate", "NTLM");
             if (cfg->use_basic_auth) {
                 apr_table_add(req->err_headers_out,
                               "WWW-Authenticate",
@@ -784,6 +852,14 @@ static const char *mag_use_basic_auth(cmd_parms *parms, void *mconfig, int on)
     return NULL;
 }
 
+static const char *mag_use_ntlm_auth(cmd_parms *parms, void *mconfig, int on)
+{
+    struct mag_config *cfg = (struct mag_config *)mconfig;
+
+    cfg->use_ntlm_auth = on ? true : false;
+    return NULL;
+}
+
 static const command_rec mag_commands[] = {
     AP_INIT_FLAG("GssapiSSLonly", mag_ssl_only, NULL, OR_AUTHCFG,
                   "Work only if connection is SSL Secured"),
@@ -809,6 +885,8 @@ static const command_rec mag_commands[] = {
     AP_INIT_FLAG("GssapiBasicAuth", mag_use_basic_auth, NULL, OR_AUTHCFG,
                      "Allows use of Basic Auth for authentication"),
 #endif
+    AP_INIT_FLAG("GssapiNTLMAuth", mag_use_ntlm_auth, NULL, OR_AUTHCFG,
+                     "Allows use of NTML Auth without Negotiate"),
     { NULL }
 };
 
