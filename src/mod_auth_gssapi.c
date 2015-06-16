@@ -207,6 +207,254 @@ static void mag_store_deleg_creds(request_rec *req,
     *ccachefile = value;
 }
 
+typedef struct _ad_sids
+{
+  char **sids;
+  unsigned int count;
+
+} ad_sids;
+
+/* The following structs are designed to get the size and location of each data type, 
+ *  * not to represent the details of the inner data structures
+ *   */
+typedef struct _kerb_validation_info_header
+{
+  unsigned char rpc_headeaders[20];
+} kerb_validation_info_header;
+
+typedef struct _rpc_unicode_string_header
+{
+  unsigned char length[8];
+  unsigned char element[4];
+} rpc_unicode_string_header;
+
+typedef struct _kerb_validation_info
+{
+  unsigned char logon_time[8];
+  unsigned char logon_off_time[8];
+  unsigned char kick_off_time[8];
+  unsigned char password_last_set[8];
+  unsigned char password_can_change[8];
+  unsigned char password_must_change[8];
+  unsigned char p_effective_name[8];
+  unsigned char p_full_name[8];
+  unsigned char p_logon_script[8];
+  unsigned char p_profile_path[8];
+  unsigned char p_home_directory[8];
+  unsigned char p_home_directory_drive[8];
+  unsigned char logon_count[2];
+  unsigned char bad_password_count[2];
+  unsigned char user_id[4];
+  unsigned char primary_group_id[4];
+  unsigned char group_count[4];
+  unsigned char p_group_ids[4];
+  unsigned char user_flags[4];
+  unsigned char user_session_key[16];
+  unsigned char p_logon_server[8];
+  unsigned char p_logon_domain_name[8];
+  unsigned char p_logon_domain_id[4];
+  unsigned char reserved1[8];
+  unsigned char user_account_control[4];
+  unsigned char reserved2[28];
+  unsigned char sid_count[4];
+  unsigned char p_extra_sids[4];
+  unsigned char p_resource_group_domain_sid[4];
+  unsigned char resource_group_count[4];
+  unsigned char p_resource_group_ids[4];
+} kerb_validation_info;
+
+/* data length of various SID components */
+#define SID_REVISION_STR_LEN      3
+#define SID_ID_AUTH_STR_LEN       3
+#define SID_SUB_AUTH_STR_LEN      10
+#define SID_REVISION_LEN          1
+#define SID_ID_AUTH_LEN           1
+#define SID_SUB_AUTH_LEN          4
+#define SID_SUB_AUTH_NUM_LEN      6
+#define RELATIVE_SID_TOTAL_LEN    8
+#define RELATIVE_SID_LEN          4
+#define LOGON_DOMAIN_SID_AUTH_LEN 4
+#define EXTRA_SID_HEADER_LEN      4
+#define EXTRA_SID_STRUCT_LEN      8
+#define EXTRA_SID_AUTH_LEN 4
+
+/* RPC String and other data length */
+#define RPC_STRING_LEN            4
+#define RPC_STRING_MAX_LEN        8
+#define PROFILE_STRING_NUM        6
+#define LOGON_STRING_NUM          2
+#define GROUP_LEN                 4
+#define BIT_NUM_IN_BYTE           8
+
+static unsigned int
+get_decimal (unsigned int pos, unsigned int len,
+	     unsigned char *validation_data)
+{
+  unsigned int i, j;
+  for (i = 0, j = 0; i < len; i++)
+    {
+      j += (unsigned int) validation_data[pos + i] << (BIT_NUM_IN_BYTE * i);
+    }
+  return j;
+}
+
+static unsigned int
+get_rpc_string_buffer_size (int pos, unsigned char *validation_data)
+{
+  unsigned int ret, actual_elems;
+  ret =
+    get_decimal (pos + RPC_STRING_MAX_LEN, RPC_STRING_LEN, validation_data);
+  actual_elems = (ret % 2) ? ret + 1 : ret;
+  return RPC_STRING_MAX_LEN + RPC_STRING_LEN + actual_elems * 2;
+}
+
+static char *
+get_string_sid (unsigned int pos, unsigned int *sid_pos,
+		unsigned char *validation_data, request_rec * r)
+{
+  unsigned int next_pos;
+  unsigned int sub_auth_num;
+  unsigned int revision;
+  unsigned int identifier_auth;
+  unsigned int sub_auth;
+  unsigned int i;
+  unsigned int len;
+  char sid_header[] = "S-";
+  char *sid, *p_sid;
+
+  revision = get_decimal (pos, SID_REVISION_LEN, validation_data);
+  next_pos = pos + SID_REVISION_LEN;
+
+  sub_auth_num =
+    get_decimal (next_pos, SID_SUB_AUTH_NUM_LEN, validation_data);
+  next_pos += SID_SUB_AUTH_NUM_LEN;
+
+  identifier_auth = get_decimal (next_pos, SID_ID_AUTH_LEN, validation_data);
+  next_pos += SID_ID_AUTH_LEN;
+
+  len = strlen (sid_header) + SID_REVISION_STR_LEN + strlen ("-") +
+    SID_ID_AUTH_STR_LEN + strlen ("-") +
+    SID_SUB_AUTH_STR_LEN * (sub_auth_num + 1) + strlen ("-") * sub_auth_num +
+    1;
+
+  sid = (char *) apr_pcalloc (r->pool, len);
+  p_sid = sid;
+  /* sid is large enough to hold SID components */
+  sprintf (p_sid, "%s%u-%u-", sid_header, revision, identifier_auth);
+  p_sid = sid + strlen (sid);
+
+  for (i = 0; i < sub_auth_num; i++)
+    {
+      sub_auth = get_decimal (next_pos, SID_SUB_AUTH_LEN, validation_data);
+      if (i == sub_auth_num - 1)
+	sprintf (p_sid, "%u", sub_auth);
+      else
+	sprintf (p_sid, "%u-", sub_auth);
+      p_sid = sid + strlen (sid);
+      next_pos += SID_SUB_AUTH_LEN;
+    }
+
+  *sid_pos = next_pos;
+  return sid;
+}
+
+static ad_sids *extract_sids (request_rec * r, unsigned char *validation_data)
+{
+  unsigned int i, j;
+  unsigned int group_count;
+  unsigned int group_count_pos;
+  unsigned int group_pos;
+  unsigned int logon_domain_id_pos;
+  unsigned int extra_sid_count;
+  unsigned int extra_sid_pos;
+  unsigned int extra_sid_data_pos;
+  unsigned int domain_sid_str_len;
+  unsigned int logon_string_pos;
+  unsigned int count = 0;
+  char *sid;
+  char **sids;
+  ad_sids *client_sids;
+  kerb_validation_info kerb_info;
+
+  client_sids =
+    (ad_sids *) apr_pcalloc (r->connection->pool, sizeof (ad_sids));
+  group_count_pos =
+    sizeof (kerb_validation_info_header) + &kerb_info.group_count[0] -
+    &kerb_info.logon_time[0];
+  group_count =
+    get_decimal (group_count_pos, sizeof (kerb_info.group_count),
+		 validation_data);
+
+  extra_sid_count =
+    get_decimal (sizeof (kerb_validation_info_header) +
+		 &kerb_info.sid_count[0] - &kerb_info.logon_time[0],
+		 sizeof (kerb_info.sid_count), validation_data);
+
+  for (i = 0, j = 0; i < PROFILE_STRING_NUM; i++)
+    {
+      j += get_rpc_string_buffer_size (sizeof (kerb_validation_info_header) +
+				       sizeof (kerb_validation_info) + j,
+				       validation_data);
+    }
+
+  group_pos =
+    sizeof (kerb_validation_info_header) + sizeof (kerb_validation_info) + j;
+  for (i = 0, j = group_pos + GROUP_LEN; i < group_count; i++)
+    {
+      j += RELATIVE_SID_TOTAL_LEN;
+    }
+  logon_string_pos = j;
+
+  for (i = 0, j = 0; i < LOGON_STRING_NUM; i++)
+    {
+      j += get_rpc_string_buffer_size (logon_string_pos + j, validation_data);
+    }
+
+  client_sids = apr_pcalloc (r->connection->pool, sizeof (ad_sids));
+  sids =
+    apr_pcalloc (r->connection->pool,
+		 sizeof (char *) * (group_count + extra_sid_count));
+  client_sids->sids = sids;
+
+  logon_domain_id_pos = logon_string_pos + j + LOGON_DOMAIN_SID_AUTH_LEN;
+  sid = get_string_sid (logon_domain_id_pos, &extra_sid_pos, validation_data, r);
+  domain_sid_str_len = strlen (sid);
+
+  for (i = 0, j = group_pos + GROUP_LEN; i < group_count; i++)
+    {
+      sprintf (sid + domain_sid_str_len, "-%u",
+	       get_decimal (j, RELATIVE_SID_LEN, validation_data));
+      j += RELATIVE_SID_TOTAL_LEN;
+      client_sids->sids[count] = apr_pstrdup (r->connection->pool, sid);
+      ap_log_rerror (APLOG_MARK, APLOG_DEBUG, 0, r, "Group sid number %d: %s",
+		     count, client_sids->sids[count]);
+      count++;
+    }
+  
+  if (extra_sid_count)
+    {
+      unsigned int next_sid_pos = 0;
+      extra_sid_data_pos =
+	extra_sid_pos + EXTRA_SID_HEADER_LEN +
+	EXTRA_SID_STRUCT_LEN * extra_sid_count;
+      for (i = 0, j = extra_sid_data_pos + EXTRA_SID_AUTH_LEN;
+	   i < extra_sid_count; i++)
+	{
+	  char *str_sid = get_string_sid (j, &next_sid_pos, validation_data, r);
+	  client_sids->sids[count] =
+	    apr_pstrdup (r->connection->pool, str_sid);
+	  ap_log_rerror (APLOG_MARK, APLOG_DEBUG, 0, r,
+			 "Group sid number %d: %s", count,
+			 client_sids->sids[count]);
+	  count++;
+	  j = next_sid_pos + EXTRA_SID_AUTH_LEN;	  
+	}
+    }
+
+  client_sids->count = count;
+  return client_sids;
+}
+
 static int mag_auth(request_rec *req)
 {
     const char *type;
@@ -242,6 +490,14 @@ static int mag_auth(request_rec *req)
     bool is_basic = false;
     gss_ctx_id_t user_ctx = GSS_C_NO_CONTEXT;
     gss_name_t server = GSS_C_NO_NAME;
+    int mn_name;
+    gss_buffer_set_t attrs = GSS_C_NO_BUFFER_SET;
+    gss_buffer_desc attr_value = GSS_C_EMPTY_BUFFER;
+  gss_buffer_desc display_value = GSS_C_EMPTY_BUFFER;
+  int authenticated = 0;
+  int complete = 0;
+  int more = -1;
+  int i;
 #ifdef HAVE_GSS_KRB5_CCACHE_NAME
     const char *user_ccache = NULL;
     const char *orig_ccache = NULL;
@@ -444,7 +700,7 @@ static int mag_auth(request_rec *req)
     }
 #endif
 
-    if (1) {
+    if (is_ntlm || 1) {
         maj = gss_create_empty_oid_set(&min, &desired_mechs);
         if (GSS_ERROR(maj)) {
             ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, req,
@@ -460,10 +716,11 @@ static int mag_auth(request_rec *req)
                                               " failed", maj, min));
             goto done;
         }
+    }
         if (!acquired_cred) {
-            /* Try to acquire default creds */
+            /* Try to acquire default acceptor creds */
             maj = gss_acquire_cred(&min, GSS_C_NO_NAME, GSS_C_INDEFINITE,
-                                   desired_mechs, cred_usage,
+                                   /*desired_mechs*/ NULL, cred_usage,
                                    &acquired_cred, NULL, NULL);
             if (GSS_ERROR(maj)) {
                 ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, req,
@@ -471,15 +728,24 @@ static int mag_auth(request_rec *req)
                                               " failed", maj, min));
                 goto done;
             }
+
+           // maj = gss_set_neg_mechs(&min, acquired_cred, desired_mechs);
+            if (GSS_ERROR(maj)) {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, req,
+                              "%s", mag_error(req, "gss_set_neg_mechs()"
+                                              " failed", maj, min));
+                goto done;
+            }
+
+            gss_release_oid_set(&min, &desired_mechs);
         }
-        maj = gss_inquire_cred(&min, acquired_cred, &server,
-                               NULL, NULL, NULL);
-        if (GSS_ERROR(maj)) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, req,
-                          "%s", mag_error(req, "gss_inquired_cred_() "
-                                          "failed", maj, min));
-            goto done;
-        }
+    maj = gss_inquire_cred(&min, acquired_cred, &server,
+                           NULL, NULL, NULL);
+    if (GSS_ERROR(maj)) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, req,
+                      "%s", mag_error(req, "gss_inquired_cred() "
+                                      "failed", maj, min));
+        goto done;
     }
 
     if (is_basic) {
@@ -506,12 +772,12 @@ static int mag_auth(request_rec *req)
                                 maj, min));
         goto done;
     }
-    /*maj = gss_oid_to_str(&min, mech_type, &mech_buff);
+    maj = gss_oid_to_str(&min, mech_type, &mech_buff);
     if (GSS_ERROR(maj)) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, req, "%s",
                       mag_error(req, "gss_oid_to_str() failed",
                                 maj, min));
-        goto done;
+        goto here;
     }
     if(mech_buff.length && mech_buff.value)
         fprintf(stderr, "Mech OID from accept: %.*s\n",
@@ -519,18 +785,128 @@ static int mag_auth(request_rec *req)
     else
         fprintf(stderr, "No Mech OID from accept\n");
     gss_release_buffer(&min, &mech_buff);
+here:
+    mech_type = GSS_C_NULL_OID;
+    maj = gss_inquire_name(&min, client, &mn_name, &mech_type, &attrs);
+    if (GSS_ERROR(maj)) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, req, "%s",
+                      mag_error(req, "gss_map_name_to_any() failed",
+                                maj, min));
+        goto done;
+    }
+
+    if(attrs == GSS_C_NO_BUFFER_SET || !attrs || !attrs->count)
+        fprintf(stderr, "No authz data\n");
+    else {
+        char *tst_grp = calloc(1,1000);
+        int tlen = apr_base64_decode(tst_grp, "AQUAAAAAAAUVAAAAHqNECUqBjc8BXYmpdwQAAA==");
+        char *t_str = get_string_sid(0, &tlen, tst_grp, req);
+        ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, req, "TST SID: %s", t_str);
+
+        gss_buffer_desc pac_name = {
+		.value = "urn:mspac:",
+		.length = sizeof("urn:mspac:")-1
+	};
+        more = -1;
+        attr_value.value = NULL;
+        display_value.value = NULL;
+        maj = gss_get_name_attribute (&min,
+                                      client,
+                                      &pac_name,
+                                      &authenticated,
+                                      &complete,
+                                      &attr_value,
+                                      &display_value,
+                                      &more);
+        if (GSS_ERROR(maj)) {
+                     ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, req, "%s",
+                         mag_error(req, "gss_map_name_to_any() failed",
+                                maj, min));
+                     goto done;
+        }
+
+        fprintf(stderr, "authenticated: %d - complete: %d - more: %d\n", authenticated, complete, more);
+        fprintf(stderr, "attr_value.value: %s\n", (char *) attr_value.value);
+        fprintf(stderr, "attr_value.length: %d\n", attr_value.length);
+        fprintf(stderr, "display_value.value: %s\n", (char *) display_value.value);
+        gss_release_buffer (&min, &attr_value);
+        gss_release_buffer (&min, &display_value);
+
+        fprintf(stderr, "initial count: %d\n", attrs->count);
+        for(i = 1; i < attrs->count; i++) {
+            more = -1;
+            while(more) {
+                attr_value.value = NULL;
+                display_value.value = NULL;
+                maj = gss_get_name_attribute (&min,
+				              client,
+				              &attrs->elements[i],
+				              &authenticated,
+				              &complete,
+				              &attr_value, 
+                                              &display_value, 
+                                              &more);
+                 if (GSS_ERROR(maj)) {
+                     ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, req, "%s",
+                         mag_error(req, "gss_map_name_to_any() failed",
+                                maj, min));
+                     goto done;
+                }
+                
+                ad_sids *sids = extract_sids(req, attr_value.value);
+                if (sids) {
+                    int j;
+                    for (j = 0; j < sids->count; j++) {
+	                ap_log_rerror (APLOG_MARK, APLOG_DEBUG, 0, req,
+		    	     "%s MAG SID: %s", req->user,  //ah, user not yet set
+		    	     sids->sids[j]);
+	             }
+	        }
+
+                attr_value.value = NULL;
+                maj = gsskrb5_extract_authz_data_from_sec_context(&min, *pctx, 128, &attr_value);
+                if (GSS_ERROR(maj)) {
+                     ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, req, "%s",
+                         mag_error(req, "gsskrb5_extract_authz_data_from_sec_context() failed",
+                                maj, min));
+                     goto done;
+                }
+                fprintf(stderr, "i: %d - authenticated: %d - complete: %d - more: %d\n", i, authenticated, complete, more);
+                fprintf(stderr, "attr_value.value: %s\n", (char *) attr_value.value);
+                fprintf(stderr, "attr_value.length: %d\n", attr_value.length);
+                fprintf(stderr, "display_value.value: %s\n", (char *) display_value.value);
+                gss_release_buffer (&min, &attr_value);
+                gss_release_buffer (&min, &display_value);
+            }
+        fprintf(stderr, "count: %d\n", attrs->count);
+        }  
+    }
+
+    gss_release_buffer_set (&min, &attrs);
+
+
+
+
+
+
+
+
+
+
+
+
 
     if(is_ntlm) {
         if(mech_type->length != ntlm_mech_oid.length ||
             memcmp(mech_type->elements, ntlm_mech_oid.elements, mech_type->length)) {
             ap_log_rerror(APLOG_MARK, APLOG_ERR|APLOG_NOERRNO, 0, req,
-                          "Not NTLM mech in an NTLM authentication - aborting");
+                          "Not NTLM mech inside NTLM authentication - aborting");
             gss_delete_sec_context(&min, pctx, GSS_C_NO_BUFFER);
             gss_release_buffer(&min, &output);
             output.length = 0;
             goto done;
         }
-    } */
+    }
 
     if (is_basic) {
         while (maj == GSS_S_CONTINUE_NEEDED) {
