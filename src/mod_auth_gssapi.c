@@ -511,7 +511,7 @@ static bool mag_auth_basic(request_rec *req,
 #ifdef HAVE_CRED_STORE
     if (cfg->deleg_ccache_dir) {
         /* delegate ourselves credentials so we store them as requested */
-        init_flags |= GSS_C_DELEG_FLAG;
+        //init_flags |= GSS_C_DELEG_FLAG;
     }
 #endif
 
@@ -548,7 +548,7 @@ static bool mag_auth_basic(request_rec *req,
             maj = gss_accept_sec_context(&min, &server_ctx, acquired_cred,
                                          &input, GSS_C_NO_CHANNEL_BINDINGS,
                                          client, mech_type, &output, NULL,
-                                         vtime, delegated_cred);
+                                         vtime, NULL);
             if (GSS_ERROR(maj)) {
                 ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, req,
                               "%s", mag_error(req, "gss_accept_sec_context()"
@@ -564,6 +564,8 @@ static bool mag_auth_basic(request_rec *req,
         }
     }
 
+    *delegated_cred = user_cred;
+
 done:
     gss_release_buffer(&min, &output);
     gss_release_buffer(&min, &input);
@@ -573,7 +575,7 @@ done:
     gss_delete_sec_context(&min, &server_ctx, GSS_C_NO_BUFFER);
     gss_release_cred(&min, &acquired_cred);
     gss_release_name(&min, &user);
-    gss_release_cred(&min, &user_cred);
+    //gss_release_cred(&min, &user_cred);
     gss_delete_sec_context(&min, &user_ctx, GSS_C_NO_BUFFER);
     gss_release_oid_set(&min, &actual_mechs);
     gss_release_oid_set(&min, &filtered_mechs);
