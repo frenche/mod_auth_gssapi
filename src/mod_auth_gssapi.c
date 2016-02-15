@@ -498,6 +498,10 @@ static bool mag_auth_basic(request_rec *req,
         goto done;
     }
 
+    /* if we delegate tgt we don't need constrained delegation */
+    if (cfg->delegate_basic)
+        cred_usage = GSS_C_ACCEPT;
+
     if (cred_usage == GSS_C_BOTH) {
         /* must acquire with GSS_C_ACCEPT to get the server name */
         if (!mag_acquire_creds(req, cfg, actual_mechs,
@@ -509,7 +513,7 @@ static bool mag_auth_basic(request_rec *req,
     }
 
 #ifdef HAVE_CRED_STORE
-    if (cfg->deleg_ccache_dir) {
+    if (cfg->deleg_ccache_dir && cfg->delegate_basic) {
         /* delegate ourselves credentials so we store them as requested */
         init_flags |= GSS_C_DELEG_FLAG;
     }
@@ -1131,6 +1135,14 @@ static const char *mag_deleg_ccache_dir(cmd_parms *parms, void *mconfig,
 
     return NULL;
 }
+
+static const char *mag_delegate_basic(cmd_parms *parms, void *mconfig, int on)
+{
+    struct mag_config *cfg = (struct mag_config *)mconfig;
+    cfg->delegate_basic = on ? true : false;
+
+    return NULL;
+}
 #endif
 
 #ifdef HAVE_GSS_ACQUIRE_CRED_WITH_PASSWORD
@@ -1351,6 +1363,8 @@ static const command_rec mag_commands[] = {
                     "Credential Store"),
     AP_INIT_RAW_ARGS("GssapiDelegCcacheDir", mag_deleg_ccache_dir, NULL,
                      OR_AUTHCFG, "Directory to store delegated credentials"),
+    AP_INIT_FLAG("GssapiDelegateBasicAuth", mag_delegate_basic, NULL, OR_AUTHCFG,
+                  "Whether to delegate credentials acquired with basic auth"),
 #endif
 #ifdef HAVE_GSS_ACQUIRE_CRED_WITH_PASSWORD
     AP_INIT_FLAG("GssapiBasicAuth", mag_use_basic_auth, NULL, OR_AUTHCFG,

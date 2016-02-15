@@ -264,3 +264,15 @@ underscores for environment variable names.
 #### Example
     GssapiNameAttributes json
     GssapiNameAttributes RADIUS_NAME urn:ietf:params:gss:radius-attribute_1
+
+
+### GssapiDelegateBasicAuth
+
+Specifies whether to delegate krb5 credentials acquired with basic auth.
+This option is off by default so only constrained delegation credentials
+will be stored (if obtained with s4u2Proxy).
+
+This option requires GssapiDelegCcacheDir to be set.
+
+#### Example
+    GssapiDelegateBasicAuth On

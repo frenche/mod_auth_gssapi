@@ -66,6 +66,7 @@ struct mag_config {
     bool use_sessions;
 #ifdef HAVE_CRED_STORE
     bool use_s4u2proxy;
+    bool delegate_basic;
     char *deleg_ccache_dir;
     gss_key_value_set_desc *cred_store;
 #endif
