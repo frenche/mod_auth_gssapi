@@ -823,20 +823,35 @@ static int mag_auth(request_rec *req)
         return HTTP_UNAUTHORIZED;
     }
 
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
+                              "URI: %s: %sprev, %smain", req->uri,
+                              req->prev ? "with " : "no ",
+                              req->main ? "with " : "no ");
+
     /* implicit auth for subrequests if main auth already happened */
-    if (!ap_is_initial_req(req) && req->main != NULL) {
-        type = ap_auth_type(req->main);
+    if (!ap_is_initial_req(req)) {
+        request_rec *main_req = req;
+        while (main_req->main)
+            main_req = main_req->main;
+        while (main_req->prev)
+            main_req = main_req->prev;
+
+        type = ap_auth_type(main_req);
         if ((type != NULL) && (strcasecmp(type, "GSSAPI") == 0)) {
             /* warn if the subrequest location and the main request
              * location have different configs */
-            if (cfg != ap_get_module_config(req->main->per_dir_config,
+            if (cfg != ap_get_module_config(main_req->per_dir_config,
                                             &auth_gssapi_module)) {
                 ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0,
                               req, "Subrequest authentication bypass on "
                                    "location with different configuration!");
             }
-            if (req->main->user) {
-                req->user = apr_pstrdup(req->pool, req->main->user);
+            if (main_req->user) {
+                req->user = apr_pstrdup(req->pool, main_req->user);
+                /* TODO: it seems we need to export request data for internal
+                 * redirects, but not for subrequests.
+                 * For now, let's just export GSS_NAME */
+                apr_table_set(req->subprocess_env, "GSS_NAME", req->user);
                 return OK;
             } else {
                 ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, req,
